@@ -829,3 +829,300 @@ assert ordinary_callbacks == [new_runtime_id]
 """
     _, err, status, _ = run_python_code_in_subprocess(code)
     assert status == 0, err
+
+
+def test_tracer_microvm_identity_refresh_recreates_exporter_without_fork_side_effects():
+    """Tracer MicroVM refresh must not reuse fork recreation semantics."""
+    from unittest import mock
+
+    from ddtrace._trace.tracer import Tracer
+    from ddtrace.internal import runtime
+
+    with mock.patch("ddtrace._trace.tracer.store_metadata"):
+        tracer = Tracer()
+
+    try:
+        tracer._post_fork_writer_pending = True
+        with (
+            mock.patch.object(tracer, "_recreate") as recreate,
+            mock.patch.object(tracer, "_store_metadata") as store_metadata,
+        ):
+            tracer._refresh_runtime_identity(runtime.get_runtime_id())
+
+        recreate.assert_called_once_with(reset_buffer=False, flush_writer=False)
+        store_metadata.assert_called_once_with()
+        assert tracer._post_fork_writer_pending is False
+        assert tracer._new_process is False
+    finally:
+        tracer.shutdown()
+
+
+def test_tracer_microvm_identity_refresh_after_shutdown_does_not_recreate_writer():
+    """A /run after shutdown must not build a writer that nothing will stop."""
+    from unittest import mock
+
+    from ddtrace._trace.tracer import Tracer
+    from ddtrace.internal import runtime
+
+    with mock.patch("ddtrace._trace.tracer.store_metadata"):
+        tracer = Tracer()
+    tracer.shutdown()
+
+    with (
+        mock.patch.object(tracer, "_recreate") as recreate,
+        mock.patch.object(tracer, "_store_metadata") as store_metadata,
+    ):
+        tracer._refresh_runtime_identity(runtime.get_runtime_id())
+
+    recreate.assert_not_called()
+    store_metadata.assert_not_called()
+
+
+@pytest.mark.subprocess(env={"AWS_LAMBDA_MICROVM_IMAGE_ARN": "arn:aws:lambda:us-east-1::runtime:python3.12"}, err=None)
+def test_tracer_microvm_identity_refresh_keeps_pending_after_recreate_failure():
+    from unittest import mock
+
+    import pytest
+
+    from ddtrace._trace.tracer import Tracer
+    from ddtrace.internal import runtime
+
+    with mock.patch("ddtrace._trace.tracer.store_metadata"):
+        tracer = Tracer()
+
+    try:
+        tracer._post_fork_writer_pending = True
+        with (
+            mock.patch.object(tracer, "_recreate", side_effect=RuntimeError("recreate failed")) as recreate,
+            mock.patch.object(tracer, "_store_metadata") as store_metadata,
+            pytest.raises(RuntimeError),
+        ):
+            tracer._refresh_runtime_identity(runtime.get_runtime_id())
+
+        recreate.assert_called_once_with(reset_buffer=False, flush_writer=False)
+        store_metadata.assert_not_called()
+        assert tracer._post_fork_writer_pending is True
+    finally:
+        tracer.shutdown()
+
+
+@pytest.mark.subprocess(env={"AWS_LAMBDA_MICROVM_IMAGE_ARN": "arn:aws:lambda:us-east-1::runtime:python3.12"}, err=None)
+def test_tracer_microvm_identity_refresh_schedules_rebuild_after_recreate_failure():
+    """/run is not repeated, so a failed refresh rebuild must leave a rebuild pending for the next span."""
+    from unittest import mock
+
+    import pytest
+
+    from ddtrace._trace.tracer import Tracer
+    from ddtrace.internal import runtime
+
+    class PanicException(BaseException):
+        # PyO3 raises Rust panics as a BaseException subclass, which "except Exception" would miss.
+        pass
+
+    with mock.patch("ddtrace._trace.tracer.store_metadata"):
+        tracer = Tracer()
+
+    try:
+        for error in (RuntimeError("recreate failed"), PanicException("exporter build panicked")):
+            tracer._post_fork_writer_pending = False
+            with (
+                mock.patch.object(tracer, "_recreate", side_effect=error),
+                mock.patch.object(tracer, "_store_metadata") as store_metadata,
+                pytest.raises(type(error)),
+            ):
+                tracer._refresh_runtime_identity(runtime.get_runtime_id())
+
+            store_metadata.assert_not_called()
+            assert tracer._post_fork_writer_pending is True
+    finally:
+        tracer._post_fork_writer_pending = False
+        tracer.shutdown()
+
+
+@pytest.mark.subprocess(env={"AWS_LAMBDA_MICROVM_IMAGE_ARN": "arn:aws:lambda:us-east-1::runtime:python3.12"}, err=None)
+def test_tracer_microvm_identity_refresh_retries_failed_writer_recreation_on_next_span():
+    """A refresh whose writer rebuild fails must not leave the closed writer installed for good."""
+    from unittest import mock
+
+    import pytest
+
+    from ddtrace._trace.tracer import Tracer
+    from ddtrace.internal import runtime
+    import ddtrace.internal._runtime_id as runtime_impl
+
+    class FlakyWriter:
+        recreate_calls = 0
+
+        def __init__(self):
+            self.traces = []
+            self.closed = False
+
+        def write(self, spans):
+            # Mirrors the write gate of a writer closed by refresh.
+            if not self.closed:
+                self.traces.append(spans)
+
+        def _stop_accepting_writes(self):
+            self.closed = True
+
+        def recreate(self, **kwargs):
+            FlakyWriter.recreate_calls += 1
+            if FlakyWriter.recreate_calls == 1:
+                raise RuntimeError("exporter build failed")
+            return FlakyWriter()
+
+        def flush_queue(self):
+            pass
+
+        def stop(self, timeout=None):
+            pass
+
+    with (
+        mock.patch("ddtrace._trace.processor.create_trace_writer", side_effect=lambda **kwargs: FlakyWriter()),
+        mock.patch("ddtrace._trace.tracer.store_metadata"),
+    ):
+        tracer = Tracer()
+    aggregator = tracer._span_aggregator
+    old_writer = aggregator.writer
+
+    try:
+        runtime_impl._refresh_runtime_id()
+        with pytest.raises(RuntimeError):
+            tracer._refresh_runtime_identity(runtime.get_runtime_id())
+
+        assert aggregator.writer is old_writer
+        assert old_writer.closed
+        assert tracer._post_fork_writer_pending is True
+
+        tracer.start_span("after-failed-refresh").finish()
+
+        new_writer = aggregator.writer
+        assert FlakyWriter.recreate_calls == 2
+        assert new_writer is not old_writer
+        assert tracer._post_fork_writer_pending is False
+        assert [[span.name for span in trace] for trace in new_writer.traces] == [["after-failed-refresh"]]
+        assert old_writer.traces == []
+    finally:
+        tracer.shutdown()
+
+
+@pytest.mark.subprocess(env={"AWS_LAMBDA_MICROVM_IMAGE_ARN": "arn:aws:lambda:us-east-1::runtime:python3.12"}, err=None)
+def test_identity_refresh_hook_notifies_global_tracer():
+    """The global tracer must rebuild its identity-bound state on the MicroVM /run hook."""
+    from unittest import mock
+
+    from ddtrace import tracer
+    from ddtrace.contrib._events.web_framework import WebFrameworkEvents
+    from ddtrace.internal import core
+    import ddtrace.internal.runtime as runtime
+    from ddtrace.internal.serverless import MICROVM_RUN_HOOK_METHOD
+    from ddtrace.internal.serverless import MICROVM_RUN_HOOK_PATH
+
+    # The /run listener is registered at import once the full refresh stack is in place.
+    core.on(WebFrameworkEvents.WEB_REQUEST_STARTING.value, runtime.maybe_refresh_identity)
+    with (
+        mock.patch.object(tracer, "_recreate") as recreate,
+        mock.patch.object(tracer, "_store_metadata") as store_metadata,
+    ):
+        core.dispatch(
+            WebFrameworkEvents.WEB_REQUEST_STARTING.value,
+            (MICROVM_RUN_HOOK_METHOD, MICROVM_RUN_HOOK_PATH),
+        )
+
+    recreate.assert_called_once_with(reset_buffer=False, flush_writer=False)
+    store_metadata.assert_called_once_with()
+
+
+@pytest.mark.subprocess(
+    env={
+        "AWS_LAMBDA_MICROVM_IMAGE_ARN": "arn:aws:lambda:us-east-1::runtime:python3.12",
+        "_DD_GLOBAL_TRACER_INIT": "false",
+        "DD_INSTRUMENTATION_TELEMETRY_ENABLED": "false",
+    },
+    err=None,
+)
+def test_deferred_global_tracer_registers_identity_refresh_callback():
+    """An explicitly imported global tracer must refresh after deferred initialization."""
+    from unittest import mock
+
+    from ddtrace.contrib._events.web_framework import WebFrameworkEvents
+    from ddtrace.internal import core
+    import ddtrace.internal.runtime as runtime
+    from ddtrace.internal.serverless import MICROVM_RUN_HOOK_METHOD
+    from ddtrace.internal.serverless import MICROVM_RUN_HOOK_PATH
+    from ddtrace.trace import tracer
+
+    # The /run listener is registered at import once the full refresh stack is in place.
+    core.on(WebFrameworkEvents.WEB_REQUEST_STARTING.value, runtime.maybe_refresh_identity)
+    with (
+        mock.patch.object(tracer, "_recreate") as recreate,
+        mock.patch.object(tracer, "_store_metadata") as store_metadata,
+    ):
+        core.dispatch(
+            WebFrameworkEvents.WEB_REQUEST_STARTING.value,
+            (MICROVM_RUN_HOOK_METHOD, MICROVM_RUN_HOOK_PATH),
+        )
+
+    recreate.assert_called_once_with(reset_buffer=False, flush_writer=False)
+    store_metadata.assert_called_once_with()
+
+
+@pytest.mark.subprocess(
+    env={"AWS_LAMBDA_MICROVM_IMAGE_ARN": None, "_DD_GLOBAL_TRACER_INIT": "false"},
+    err=None,
+)
+def test_deferred_global_tracer_does_not_register_identity_refresh_callback_outside_microvm():
+    """Deferred global tracer initialization must not change non-MicroVM refresh behavior."""
+    from unittest import mock
+
+    import ddtrace.internal.runtime as runtime
+    from ddtrace.trace import tracer
+
+    with mock.patch.object(tracer, "_recreate") as recreate:
+        runtime.refresh_identity()
+
+    recreate.assert_not_called()
+
+
+@pytest.mark.subprocess(env={"AWS_LAMBDA_MICROVM_IMAGE_ARN": "arn:aws:lambda:us-east-1::runtime:python3.12"}, err=None)
+def test_tracer_microvm_identity_refresh_closes_and_flushes_old_writer():
+    """The refresh sends what the old writer buffered, then the old writer rejects later spans."""
+    from unittest import mock
+
+    from ddtrace._trace.tracer import Tracer
+    import ddtrace.internal._runtime_id as runtime_impl
+    from ddtrace.internal.service import ServiceStatus
+    from ddtrace.internal.writer import NativeWriter
+    from ddtrace.trace import Span
+
+    old_writer = NativeWriter("http://dne:1234", processing_interval=10)
+    with (
+        mock.patch("ddtrace._trace.processor.create_trace_writer", return_value=old_writer),
+        mock.patch("ddtrace._trace.tracer.store_metadata"),
+    ):
+        tracer = Tracer()
+    runtime_impl.on_runtime_identity_refresh(tracer._refresh_runtime_identity)
+
+    real_exporter = old_writer._exporter
+    exporter = old_writer._exporter = mock.Mock(send=mock.Mock(return_value="{}"))
+    try:
+        old_writer._clients[0].encoder.put([Span("buffered")])
+        old_writer.start()
+
+        runtime_impl.refresh_identity()
+
+        assert tracer._span_aggregator.writer is not old_writer
+        assert old_writer._accepting_writes is False
+        # The old writer is stopped, not discarded: it sends its buffer and shuts its exporter down.
+        assert exporter.send.call_count == 1
+        exporter.shutdown.assert_called_once()
+
+        # A late span neither lands in the old writer's buffer nor restarts the stopped writer.
+        old_writer.write([Span("late")])
+        assert old_writer.status == ServiceStatus.STOPPED
+        assert len(old_writer._clients[0].encoder) == 0
+        assert exporter.send.call_count == 1
+    finally:
+        real_exporter.drop()
+        tracer.shutdown()

@@ -447,6 +447,24 @@ class Tracer:
             self._post_fork_writer_pending = False
             return True
 
+    def _refresh_runtime_identity(self, _runtime_id: str) -> None:
+        if self.start_span == self._start_span_after_shutdown:
+            # Nothing would stop a writer built now, so its native exporter workers would leak.
+            return
+        with self._post_fork_lock:
+            # The old writer still flushes what it holds when stopped, but a span written to it
+            # after that would restart it with no owner, so close it to new spans first.
+            self._span_aggregator.writer._stop_accepting_writes()
+            try:
+                self._recreate(reset_buffer=False, flush_writer=False)
+            except BaseException:
+                # /run is not repeated, so a failed rebuild would leave the closed writer installed.
+                # Retry it on the next span start, like a post-fork rebuild.
+                self._post_fork_writer_pending = True
+                raise
+            self._post_fork_writer_pending = False
+        self._store_metadata()
+
     def _recreate(
         self,
         trace_processors: Optional[list[TraceProcessor]] = None,
