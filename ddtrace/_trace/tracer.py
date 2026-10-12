@@ -50,9 +50,12 @@ from ddtrace.internal.hostname import get_hostname
 from ddtrace.internal.logger import get_logger
 from ddtrace.internal.native import PyTracerMetadata
 from ddtrace.internal.native import store_metadata
+from ddtrace.internal.native.exceptions import is_panic_exception
 from ddtrace.internal.peer_service.processor import PeerServiceProcessor
 from ddtrace.internal.runtime import get_runtime_id
 from ddtrace.internal.schema.processor import BaseServiceProcessor
+from ddtrace.internal.serverless import in_aws_lambda_microvm
+from ddtrace.internal.service import ServiceStatusError
 from ddtrace.internal.settings._config import config
 from ddtrace.internal.settings.asm import config as asm_config
 from ddtrace.internal.settings.peer_service import _ps_config
@@ -192,8 +195,10 @@ class Tracer:
         forksafe.register(self._child_after_fork)
 
         self._shutdown_lock = Lock()
-        self._post_fork_lock = forksafe.Lock()
+        # Reentrant because the exit-signal handler can run shutdown() on a thread that holds it.
+        self._post_fork_lock = forksafe.RLock()
         self._post_fork_writer_pending = False
+        self._shutting_down = False
         self._new_process = False
 
         self._store_metadata()
@@ -446,6 +451,42 @@ class Tracer:
             self._recreate(reset_buffer=False, flush_writer=False)
             self._post_fork_writer_pending = False
             return True
+
+    def _refresh_runtime_identity(self, _runtime_id: str) -> None:
+        with self._post_fork_lock:
+            if self._shutting_down:
+                # Nothing would stop a writer built now, so its native exporter workers would leak.
+                return
+            # The old writer still flushes what it holds when stopped, but a span written to it
+            # after that would restart it with no owner, so close it to new spans first.
+            self._span_aggregator.writer._stop_accepting_writes()
+            try:
+                self._recreate(reset_buffer=False, flush_writer=False)
+            except BaseException as e:
+                # /run is not repeated, so a failed rebuild would leave the closed writer installed.
+                # Retry it on the next span start, like a post-fork rebuild.
+                self._post_fork_writer_pending = True
+                if not is_panic_exception(e):
+                    raise
+                # The refresh dispatcher only contains Exception, so a Rust panic would abort the /run request.
+                log.warning("Failed to rebuild the trace writer after a runtime identity refresh", exc_info=True)
+                return
+            finally:
+                # A deferred rebuild retry does not store metadata, so store it whether or not the rebuild succeeded.
+                self._store_metadata()
+            self._post_fork_writer_pending = False
+            if self._shutting_down:
+                # shutdown() ran during the rebuild, either from an exit-signal handler on this thread or
+                # from another thread that stopped waiting for this refresh, so it stopped the writer being
+                # replaced rather than the one installed above.
+                writer = self._span_aggregator.writer
+                try:
+                    writer.stop(self.SHUTDOWN_TIMEOUT)
+                except ServiceStatusError:
+                    # The replacement never started, but a NativeWriter already built its native exporter.
+                    shutdown_exporter = getattr(writer, "shutdown_exporter", None)
+                    if shutdown_exporter is not None:
+                        shutdown_exporter()
 
     def _recreate(
         self,
@@ -1021,9 +1062,23 @@ class Tracer:
             # Already shutting down from this or another thread — skip re-entrant call
             return
         try:
-            # Do not recreate an inherited writer only to shut it down. The span aggregator
-            # discards its buffered traces during shutdown.
-            self._post_fork_writer_pending = False
+            # In a MicroVM, bound the wait by timeout: a refresh on another thread can hold this lock while
+            # waiting for a writer lock held by the thread an exit-signal handler interrupted to run this.
+            # A refresh still in flight after the wait stops the writer it installs once it sees the flag.
+            # Lock.acquire() rejects negative timeouts other than -1, which shutdown() used to accept.
+            wait = max(timeout, 0) if timeout is not None and in_aws_lambda_microvm() else -1
+            locked = self._post_fork_lock.acquire(timeout=wait)
+            try:
+                # Normally wait out an in-flight identity refresh (bounded in a MicroVM, see above) so the writer
+                # it installs is the one stopped below, and make later refreshes skip building a writer that
+                # nothing would stop.
+                self._shutting_down = True
+                # Do not recreate an inherited writer only to shut it down. The span aggregator
+                # discards its buffered traces during shutdown.
+                self._post_fork_writer_pending = False
+            finally:
+                if locked:
+                    self._post_fork_lock.release()
             self._new_process = False
             for processor in chain(self._span_processors, SpanProcessor.__processors__, [self._span_aggregator]):
                 if processor:
