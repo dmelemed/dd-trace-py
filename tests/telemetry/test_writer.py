@@ -910,8 +910,8 @@ def test_microvm_identity_refresh_rebuilds_worker_with_new_runtime_id(monkeypatc
             assert first_worker.start_calls == 1
             runtime.refresh_identity()
 
-            assert first_worker.drop_calls == 0
-            assert first_worker.stop_calls == [False]
+            assert first_worker.drop_calls == 1
+            assert first_worker.stop_calls == []
             assert workers[-1] is writer._worker
             assert workers[-1].kwargs["runtime_id"] == runtime.get_runtime_id()
             assert workers[-1].kwargs["session_id"] == runtime.get_runtime_id()
@@ -990,8 +990,8 @@ def test_microvm_shared_worker_handout_rebuilds_stale_worker(monkeypatch):
             _runtime_id._RUNTIME_ID = original_runtime_id
 
 
-def test_microvm_shared_worker_handout_withholds_worker_when_discard_fails(monkeypatch):
-    """If the stale worker can't be discarded, the exporter gets no worker rather than the stale one."""
+def test_microvm_shared_worker_handout_withholds_worker_when_drop_fails(monkeypatch):
+    """If the stale worker can't be dropped, the exporter gets no worker rather than the stale one."""
     from ddtrace.internal import _runtime_id
     from ddtrace.internal import runtime
     import ddtrace.internal.native as native
@@ -1005,8 +1005,8 @@ def test_microvm_shared_worker_handout_withholds_worker_when_discard_fails(monke
         def __init__(self, native_runtime, **kwargs):
             workers.append(self)
 
-        def stop(self, send_app_closing=True):
-            raise RuntimeError("stop failed")
+        def drop(self):
+            raise RuntimeError("drop failed")
 
         def __getattr__(self, name):
             def _noop(*args, **kwargs):
@@ -1030,13 +1030,33 @@ def test_microvm_shared_worker_handout_withholds_worker_when_discard_fails(monke
             _runtime_id._refresh_runtime_id()
 
             assert writer._get_shared_worker() is None
-            # The failed discard keeps the old worker, which must still never be handed out.
+            # The failed drop() keeps the old worker, which must still never be handed out.
             assert writer._worker is stale_worker
         finally:
-            # Release the fake worker directly; its stop() always raises.
+            # Release the fake worker directly; its drop() always raises.
             writer._worker = None
             writer.disable()
             _runtime_id._RUNTIME_ID = original_runtime_id
+
+
+def test_microvm_identity_refresh_discard_failure_propagates():
+    from ddtrace.internal.telemetry.writer import TelemetryWriter
+
+    worker = mock.Mock()
+    worker.drop.side_effect = RuntimeError("discard failed")
+    writer = TelemetryWriter.__new__(TelemetryWriter)
+    writer._enabled = True
+    writer._worker = worker
+    writer._worker_access_lock = threading.RLock()
+    writer.started = True
+    writer._dependency_tracker = mock.Mock()
+
+    with pytest.raises(RuntimeError, match="discard failed"):
+        writer._refresh_runtime_identity("new-runtime-id")
+
+    assert writer._worker is worker
+    assert writer.started is True
+    writer._dependency_tracker.refresh.assert_not_called()
 
 
 def test_microvm_identity_refresh_stops_legacy_worker_without_drop():
@@ -1101,6 +1121,30 @@ def test_microvm_identity_refresh_stop_failure_propagates():
     notify.assert_not_called()
     writer._dependency_tracker.refresh.assert_not_called()
     writer.enable.assert_not_called()
+
+
+def test_microvm_identity_refresh_drops_worker_without_stop():
+    """A native drop() discards the worker without the flushing stop(), then detaches it."""
+    from ddtrace.internal.telemetry.writer import TelemetryWriter
+
+    worker = mock.Mock(spec=["drop", "stop"])
+    writer = TelemetryWriter.__new__(TelemetryWriter)
+    writer._worker = worker
+    writer.started = True
+    writer._worker_subscribers = []
+
+    with (
+        mock.patch("ddtrace.internal.telemetry.writer._unbind_metric_recorders") as unbind,
+        mock.patch.object(writer, "_notify_worker_changed") as notify,
+    ):
+        writer._discard_worker("while refreshing runtime identity")
+
+    worker.drop.assert_called_once_with()
+    worker.stop.assert_not_called()
+    assert writer._worker is None
+    assert writer.started is False
+    unbind.assert_called_once_with(writer)
+    notify.assert_called_once_with(None)
 
 
 def test_microvm_identity_refresh_retries_failed_rebuild():
@@ -1225,7 +1269,7 @@ def test_microvm_periodic_retries_failed_discard():
     from ddtrace.internal import runtime
 
     old_worker, replacement_worker = mock.Mock(), mock.Mock()
-    old_worker.stop.side_effect = [RuntimeError("stop failed"), None]
+    old_worker.drop.side_effect = [RuntimeError("drop failed"), None]
     writer = _microvm_refresh_writer([old_worker, replacement_worker])
     original_runtime_id = runtime.get_runtime_id()
 
@@ -1237,7 +1281,7 @@ def test_microvm_periodic_retries_failed_discard():
             writer.app_started()
             _runtime_id._refresh_runtime_id()
 
-            with pytest.raises(RuntimeError, match="stop failed"):
+            with pytest.raises(RuntimeError, match="drop failed"):
                 writer._refresh_runtime_identity(runtime.get_runtime_id())
             assert writer._worker is old_worker
 
@@ -1245,7 +1289,7 @@ def test_microvm_periodic_retries_failed_discard():
 
             assert writer._worker is replacement_worker
             assert writer._worker_runtime_id == runtime.get_runtime_id()
-            assert old_worker.stop.call_count == 2
+            assert old_worker.drop.call_count == 2
             replacement_worker.start.assert_called_once_with()
             assert writer.started is True
         finally:

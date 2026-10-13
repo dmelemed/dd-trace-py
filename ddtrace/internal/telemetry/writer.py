@@ -447,7 +447,7 @@ class TelemetryWriter:
         # Refresh callbacks run in no fixed order, and _downgrade() can rebuild the exporter on the
         # writer thread, so a MicroVM exporter can ask for a worker before this writer has refreshed.
         if self._is_microvm and not self._rebuild_stale_worker_without_lock():
-            # A failed discard keeps the old worker; hand out none so the exporter uses its own client.
+            # A failed drop() keeps the old worker; hand out none so the exporter uses its own client.
             return None
         self.enable()
         return self._worker
@@ -462,16 +462,34 @@ class TelemetryWriter:
             log.debug("Failed to rebuild the stale telemetry worker", exc_info=True)
         return self._worker is None or self._worker_runtime_id == get_runtime_id()
 
+    def _stop_worker(self, send_app_closing: bool, reason: str) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        self._worker = None
+        self.started = False
+        _unbind_metric_recorders(self)
+        self._notify_worker_changed(None)
+        try:
+            # NOTE: send_app_closing is currently ignored by the native worker
+            # (it always emits app-closing in the origin process); see
+            # TelemetryWorker.stop in ddtrace/internal/native/_native.pyi.
+            worker.stop(send_app_closing=send_app_closing)
+        except Exception:
+            log.debug("Failed to stop the native telemetry worker %s", reason, exc_info=True)
+
     def _discard_worker(self, reason: str) -> None:
-        """Stop and detach the worker built for the previous runtime ID.
+        """Discard a worker without flushing its queued telemetry.
 
-        stop() ignores its lifecycle argument and flushes the queue and app-closing under the
-        previous runtime ID. That one bounded flush is preferred over keeping the old worker,
-        which would report under the snapshot's shared runtime ID for the rest of the process
-        lifetime.
+        MicroVM identity refresh needs a non-flushing native drop(), which the bundled
+        TelemetryWorker does not expose yet; the getattr check picks it up once it does. Until
+        then, fall back to stop(), which ignores its lifecycle argument and flushes the queue and
+        app-closing under the previous runtime ID. That one bounded flush is preferred over
+        keeping the old worker, which would report under the snapshot's shared runtime ID for the
+        rest of the process lifetime.
 
-        The worker is stopped before the writer lets go of it, so a failure leaves the writer
-        unchanged and propagates. The /run refresh runs once, so periodic() and the
+        Either way the worker is discarded before the writer lets go of it, so a failure leaves
+        the writer unchanged and propagates. The /run refresh runs once, so periodic() and the
         trace exporter's worker handout retry the discard instead. A stop() that failed would
         otherwise leave the worker registered with the native runtime, which restarts it with the
         runtime after a fork.
@@ -479,7 +497,17 @@ class TelemetryWriter:
         worker = self._worker
         if worker is None:
             return
-        worker.stop(send_app_closing=False)
+        discard = getattr(worker, "drop", None)
+        if discard is None:
+            # Debug, not warning: this runs on every MicroVM refresh until the native worker exposes drop().
+            log.debug(
+                "Native TelemetryWorker does not expose drop(); stopping the worker %s, which flushes "
+                "queued telemetry under the previous runtime ID.",
+                reason,
+            )
+            worker.stop(send_app_closing=False)
+        else:
+            discard()
         self._worker = None
         self.started = False
         _unbind_metric_recorders(self)
@@ -508,18 +536,7 @@ class TelemetryWriter:
             except Exception:
                 log.debug("Failed to stop the telemetry dependency collector", exc_info=True)
             self._deps_collector = None
-        if self._worker is not None:
-            try:
-                # NOTE: send_app_closing is currently ignored by the native worker
-                # (it always emits app-closing in the origin process); see
-                # TelemetryWorker.stop in ddtrace/internal/native/_native.pyi.
-                self._worker.stop(send_app_closing=get_parent_runtime_id() is None)
-            except Exception:
-                log.debug("Failed to stop the native telemetry worker", exc_info=True)
-            self._worker = None
-            self.started = False
-            _unbind_metric_recorders(self)
-            self._notify_worker_changed(None)
+        self._stop_worker(get_parent_runtime_id() is None, "during shutdown")
 
     def _subscribe_worker_changes(
         self,
@@ -609,17 +626,11 @@ class TelemetryWriter:
             return
         # Rebuild the worker against the new endpoint/api_key. It is called early,
         # before heavy traffic.
+        # Make sure to restart the worker if it was already running.
+
         if self._worker is not None:
-            # Make sure to restart the worker if it was already running.
             was_started = self.started
-            try:
-                self._worker.stop(send_app_closing=False)
-            except Exception:
-                log.debug("Failed to stop the native telemetry worker during agentless switch", exc_info=True)
-            self._worker = None
-            self.started = False
-            _unbind_metric_recorders(self)
-            self._notify_worker_changed(None)
+            self._stop_worker(False, "during agentless switch")
             self.enable()
             if was_started:
                 self.app_started()
@@ -1181,14 +1192,7 @@ class TelemetryWriter:
         # Rebuild the worker so the new token takes effect (without the
         # non-reversible semantics of disable()).
         if self._worker is not None:
-            try:
-                self._worker.stop(send_app_closing=False)
-            except Exception:
-                log.debug("Failed to stop the native telemetry worker while setting test token", exc_info=True)
-            self._worker = None
-            self.started = False
-            _unbind_metric_recorders(self)
-            self._notify_worker_changed(None)
+            self._stop_worker(False, "while setting test token")
         self.enable()
 
     def set_payload_file_dir(self, output_dir: str) -> None:
@@ -1212,18 +1216,11 @@ class TelemetryWriter:
             return
         was_started = self.started
         if self._worker is not None:
-            try:
-                self._worker.stop(send_app_closing=False)
-            except Exception:
-                log.debug("Failed to stop the native telemetry worker while enabling payload files", exc_info=True)
-            self._worker = None
-            self.started = False
-            _unbind_metric_recorders(self)
-            self._notify_worker_changed(None)
+            self._stop_worker(False, "while enabling payload files")
         self.enable()
-        # Re-emit app-started against the file:// worker if it had already started, so the offline
-        # payload directory captures the lifecycle event rather than nothing.
         if was_started:
+            # Re-emit app-started against the file:// worker if it had already started, so the offline
+            # payload directory captures the lifecycle event rather than nothing.
             self.app_started()
 
     def _restart_sequence(self) -> None:
