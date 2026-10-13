@@ -1109,6 +1109,7 @@ class NativeWriter(periodic.PeriodicService, TraceWriter, AgentWriterInterface):
         self._shutdown_exporter(self._exporter)
 
     def _drop_exporter(self) -> None:
+        self._unsubscribe_telemetry_worker()
         with self._exporter_lock:
             # The refresh, the finishing sender, and on_shutdown() may all get here; only one drops.
             if not self._exporter_dropped:
@@ -1457,6 +1458,7 @@ class NativeWriter(periodic.PeriodicService, TraceWriter, AgentWriterInterface):
 
     def on_shutdown(self):
         if self._exporter_dropped:
+            self._unsubscribe_telemetry_worker()
             return
         if self._discarded_by_refresh:
             # Finish the refresh's discard without the final flush. drop() avoids shutdown()'s stats flush but
