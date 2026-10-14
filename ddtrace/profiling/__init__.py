@@ -11,9 +11,9 @@ is_available: bool = False
 failure_msg: str = ""
 
 
-def get_remote_config() -> Optional[dict[str, Any]]:
-    """Return the last APM_TRACING remote config ``lib_config`` the profiler received, or ``None``."""
-    return _product.last_lib_config
+def get_remote_config() -> Optional[dict[str, dict[str, Any]]]:
+    """Return the DEBUG remote configs the profiler holds, keyed by config id, or ``None`` if there are none."""
+    return dict(_product.debug_configs) or None
 
 
 class _UnavailableProfiler:
