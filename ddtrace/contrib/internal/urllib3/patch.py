@@ -9,6 +9,7 @@ from ddtrace.contrib._events.http_client import HttpClientRequestEvent
 from ddtrace.contrib.internal.trace_utils import is_tracing_enabled
 from ddtrace.internal import core
 from ddtrace.internal.compat import ensure_text
+from ddtrace.internal.constants import DEFAULT_SCHEME_PORTS
 from ddtrace.internal.schema import schematize_service_name
 from ddtrace.internal.settings import env
 from ddtrace.internal.utils import ArgumentError
@@ -80,12 +81,27 @@ def _wrap_urlopen(func, instance, args, kwargs):
 
     # HTTPConnectionPool allows relative path requests; convert the request_url to an absolute url
     if request_url.startswith("/"):
+        if config._otel_trace_semantics_enabled:
+            # url.full and server.* are derived from this URL: keep a port that is not the scheme's
+            # default and bracket IPv6 literals so the authority parses back to the real host.
+            host = str(instance.host)
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            netloc = (
+                f"{host}:{instance.port}"
+                if instance.port and instance.port != DEFAULT_SCHEME_PORTS.get(instance.scheme)
+                else host
+            )
+        else:
+            netloc = (
+                f"{instance.host}:{instance.port}"
+                if instance.port and instance.port not in DROP_PORTS
+                else str(instance.host)
+            )
         request_url = parse.urlunparse(
             (
                 instance.scheme,
-                f"{instance.host}:{instance.port}"
-                if instance.port and instance.port not in DROP_PORTS
-                else str(instance.host),
+                netloc,
                 request_url,
                 None,
                 None,
